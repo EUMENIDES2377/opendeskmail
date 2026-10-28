@@ -1,0 +1,8 @@
+{
+  "consent": {"send_test": false},
+  "test_mail": {
+    "to": "self@example.org",
+    "subject": "OpenDesk Mail example",
+    "body": "This is a fictional example. Use an explicitly authorized test recipient."
+  }
+}

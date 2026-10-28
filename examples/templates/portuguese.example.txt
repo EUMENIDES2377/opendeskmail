@@ -1,0 +1,3 @@
+Olá {{company}},
+
+Este é um exemplo fictício para pré-visualização local. Substitua este texto pela sua própria mensagem aprovada.

@@ -1,0 +1,125 @@
+[
+  {
+    "name": "click",
+    "version": "8.5.0",
+    "license": "BSD-3-Clause",
+    "notice_files": [
+      "licenses/dependencies/click-8.5.0-0-LICENSE.txt"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+    "wheel_sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360"
+  },
+  {
+    "name": "et_xmlfile",
+    "version": "2.0.0",
+    "license": "MIT",
+    "notice_files": [
+      "licenses/dependencies/et_xmlfile-2.0.0-0-LICENCE.python",
+      "licenses/dependencies/et_xmlfile-2.0.0-1-LICENCE.rst"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa",
+    "wheel_sha256": "7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa"
+  },
+  {
+    "name": "html5lib",
+    "version": "1.1",
+    "license": "MIT License",
+    "notice_files": [
+      "licenses/dependencies/html5lib-1.1-0-LICENSE"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "0d78f8fde1c230e99fe37986a60526d7049ed4bf8a9fadbad5f00e22e58e041d",
+    "wheel_sha256": "0d78f8fde1c230e99fe37986a60526d7049ed4bf8a9fadbad5f00e22e58e041d"
+  },
+  {
+    "name": "Jinja2",
+    "version": "3.1.6",
+    "license": "License :: OSI Approved :: BSD License",
+    "notice_files": [
+      "licenses/dependencies/jinja2-3.1.6-0-LICENSE.txt"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+    "wheel_sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67"
+  },
+  {
+    "name": "mailmerge",
+    "version": "2.2.4",
+    "license": "MIT (full text retained)",
+    "notice_files": [
+      "licenses/dependencies/mailmerge-2.2.4-0-LICENSE"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "cc590ac7d736d8f16d89f8e3566485870bf9d8e0d1c05a68bb12684b63295562",
+    "wheel_sha256": "cc590ac7d736d8f16d89f8e3566485870bf9d8e0d1c05a68bb12684b63295562"
+  },
+  {
+    "name": "Markdown",
+    "version": "3.11.2",
+    "license": "BSD-3-Clause",
+    "notice_files": [
+      "licenses/dependencies/markdown-3.11.2-0-LICENSE.md"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "f80390747a2a0ff2ba54da074ce4f862f72a6685f608cd2637b646a6d83993f5",
+    "wheel_sha256": "f80390747a2a0ff2ba54da074ce4f862f72a6685f608cd2637b646a6d83993f5"
+  },
+  {
+    "name": "MarkupSafe",
+    "version": "3.0.4",
+    "license": "BSD-3-Clause",
+    "notice_files": [
+      "licenses/dependencies/markupsafe-3.0.4-0-LICENSE.txt"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "11935df9bf455ed0c04eb87bcd720f02b1fe5e02128a9430f23aed6f93336fc7",
+    "wheel_sha256": "11935df9bf455ed0c04eb87bcd720f02b1fe5e02128a9430f23aed6f93336fc7"
+  },
+  {
+    "name": "openpyxl",
+    "version": "3.1.5",
+    "license": "MIT",
+    "notice_files": [
+      "licenses/dependencies/openpyxl-3.1.5-0-LICENCE.rst"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2",
+    "wheel_sha256": "5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2"
+  },
+  {
+    "name": "six",
+    "version": "1.17.0",
+    "license": "MIT",
+    "notice_files": [
+      "licenses/dependencies/six-1.17.0-0-LICENSE"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274",
+    "wheel_sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
+  },
+  {
+    "name": "tzdata",
+    "version": "2026.5",
+    "license": "Apache-2.0",
+    "notice_files": [
+      "licenses/dependencies/tzdata-2026.5-0-LICENSE",
+      "licenses/dependencies/tzdata-2026.5-1-LICENSE_APACHE"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "b683bd1b6659ddcd810ff02ad09ba821d4bf1065072805063eb35c49617905ac",
+    "wheel_sha256": "b683bd1b6659ddcd810ff02ad09ba821d4bf1065072805063eb35c49617905ac"
+  },
+  {
+    "name": "webencodings",
+    "version": "0.6.1",
+    "license": "License :: OSI Approved :: BSD License",
+    "notice_files": [
+      "licenses/dependencies/webencodings-0.6.1-0-LICENSE"
+    ],
+    "notice_source": "wheel",
+    "notice_source_sha256": "7fab6269c8bf237c657876b52058ccb182e861518d1c695c1a9aaa8c1c105d5b",
+    "wheel_sha256": "7fab6269c8bf237c657876b52058ccb182e861518d1c695c1a9aaa8c1c105d5b"
+  }
+]

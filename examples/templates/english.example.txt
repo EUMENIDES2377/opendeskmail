@@ -1,0 +1,3 @@
+Dear {{company}},
+
+This is a fictional local preview template. Replace it with your own approved message before sending.
