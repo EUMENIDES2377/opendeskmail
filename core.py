@@ -241,9 +241,12 @@ def smtp_connect(config, password):
     else:
         raise ValueError('请选择SSL/TLS或STARTTLS。')
     try:
+        stage = 'EHLO'
         smtp.ehlo()
         if security == 'STARTTLS':
+            stage = 'STARTTLS'
             smtp.starttls(context=ctx)
+            stage = 'EHLO'
             smtp.ehlo()
         # Restrict smtplib.login to one mechanism, so an authentication rejection
         # never causes fallback attempts with the same credential.
@@ -254,10 +257,12 @@ def smtp_connect(config, password):
             if not selected:
                 raise ValueError('服务器未提供受支持的密码认证；若要求 OAuth/XOAUTH2，需要适配 OAuth，不能反复尝试密码。')
             smtp.esmtp_features['auth'] = selected
+        stage = 'AUTH'
         smtp.login(config.get('username', '').strip() or sender, password)
         return smtp
-    except Exception:
+    except Exception as exc:
         smtp.close()
+        exc.smtp_stage = stage
         raise
 
 def send_one(smtp, ledger, customer, msg, sender, cap, test=False, test_key=None, archive=None):

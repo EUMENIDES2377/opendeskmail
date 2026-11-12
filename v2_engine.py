@@ -1,15 +1,15 @@
 """Threaded, restart-safe single-account controller; all transports injectable."""
-import hashlib,json,queue,threading,time,msvcrt,os
+import hashlib,json,queue,smtplib,threading,time,msvcrt,os
 from pathlib import Path
 from dataclasses import asdict
 from core import Customer,Ledger,read_customers,address_file,now,smtp_connect
 from account_guard import AccountLease
 from app_paths import DATA_ROOT
 from v2_model import HOME,STATES,templates,language,customer_fields,build_message,template_fingerprint,public_config,digest
-from v2_delivery import submit,atomic_json,verify_copies,ExcelResults
+from v2_delivery import submit,atomic_json,verify_copies,ExcelResults,smtp_details,smtp_failure
 
 def explain(exc):
-    import smtplib,ssl
+    import ssl
     if isinstance(exc,smtplib.SMTPAuthenticationError):return f'认证失败（{exc.smtp_code}），已暂停。请向服务商确认授权码、SMTP权限或OAuth要求，不要反复尝试密码。'
     if isinstance(exc,ssl.SSLCertVerificationError):return 'TLS证书校验失败，已暂停。请核对服务器、系统时间和证书链，不会关闭校验。'
     if isinstance(exc,(TimeoutError,ConnectionError)):return '连接中断或超时，已暂停。提交结果可能未知，请核查记录；不会自动重发。'
@@ -88,6 +88,7 @@ class Controller:
                 saved=self.root/f'data/attempts/{r[0]}-result.json'
                 result=json.loads(saved.read_text('utf-8')) if saved.exists() else dict(attempt_id=r[0],row=row['row'],company=r[6],email=r[1],state=r[2],started=r[3],finished=r[4] or now(),message_id=r[5],subject=r[7],reason='从数据库恢复；不会自动发送')
                 row['result']=result
+                if result.get('reason'):row['reason']=result['reason']
         self.save();self.log('已恢复记录，真实发送保持停止；须本人预览后主动继续。')
     def suppression(self):return set().union(*(address_file(self.root/'config'/name) for name in ('已发邮箱.txt','已回复邮箱.txt','不再联系.txt')))
     def prepare(self,cfg):
@@ -154,18 +155,29 @@ class Controller:
                     if row['email'] in self.ledger.blocked()|self.suppression():row.update(state='skipped',reason='发送前最新历史/拒收/回复名单已有记录');self.save();continue
                     msg=self.message(row);self.wait_boundary(lease);lease.reserve(cfg['interval']);smtp=None
                     try:
-                        self.status='submitting';self.log('正在提交：'+row['company']+' <'+row['email']+'>');smtp=self.connector(cfg,password)
-                        result=submit(smtp,self.ledger,Customer(row['row'],row['company'],row['email']),msg,cfg)
+                        self.status='submitting';self.log('正在提交：'+row['company']+' <'+row['email']+'>')
+                        try:smtp=self.connector(cfg,password)
+                        except smtplib.SMTPResponseException as exc:
+                            stage='AUTH' if isinstance(exc,smtplib.SMTPAuthenticationError) else getattr(exc,'smtp_stage','SMTP 连接')
+                            details=smtp_details(stage,exc.smtp_code,exc.smtp_error,password=password)
+                            reason,_=smtp_failure(details)
+                            self.log('SMTP 连接诊断 '+json.dumps(details,ensure_ascii=False))
+                            raise InterruptedError(reason+'，已暂停本批。') from exc
+                        result=submit(smtp,self.ledger,Customer(row['row'],row['company'],row['email']),msg,cfg,password=password)
                     finally:
                         lease.finished(cfg['interval'])
                         if smtp:
                             try:smtp.quit()
                             except Exception:smtp.close()
                     row.update(state=result['state'],result=result,reason=result.get('reason',''));sent+=1;self.job['batch_processed']=sent;results.append(result);self.last=row['company']+'：'+STATES.get(row['state'],row['state']);self.save();self.log(self.last)
+                    if result['state'] in ('failed','unknown'):
+                        diagnostic={key:value for key,value in result.items() if key.startswith('smtp_')}
+                        self.log(f"SMTP 尝试 #{result['attempt_id']} {result['reason']} "+json.dumps(diagnostic,ensure_ascii=False))
                     try:reporter.record(result)
                     except Exception as exc:
                         self.job['excel_error']=explain(exc);self.save();raise ValueError('邮件结果已写入数据库；Excel保存失败，请修复副本，禁止因此重发。')
-                    if result['state'] in ('failed','unknown'):raise InterruptedError('失败或状态待核实，已暂停本批；不会自动重试。')
+                    if result['state']=='unknown' or (result['state']=='failed' and not result.get('recipient_invalid')):
+                        raise InterruptedError(result['reason']+'，已暂停本批；不会自动重试。')
                 self.status='completed' if not any(r['state']=='ready' for r in self.job['rows']) else 'batch_done'
         except Exception as exc:
             self.status='stopped';self.last=explain(exc);self.log(self.last)

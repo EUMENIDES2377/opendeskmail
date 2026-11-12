@@ -155,7 +155,7 @@ class Application:
         cfg=dict(cfg,storage=str(self.home))
         with self.controller.lease_factory(cfg['sender']) as lease:
             stop=threading.Event();lease.wait(stop);lease.reserve(cfg['interval']);smtp=None
-            try:smtp=smtp_connect(cfg,password);r=submit(smtp,self.controller.ledger,c,msg,cfg,test=True)
+            try:smtp=smtp_connect(cfg,password);r=submit(smtp,self.controller.ledger,c,msg,cfg,test=True,password=password)
             finally:
                 lease.finished(cfg['interval'])
                 if smtp:smtp.close()

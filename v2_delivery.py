@@ -1,5 +1,5 @@
 """Durable wire results, incremental Excel output and read-only Sent checks."""
-import hashlib,json,os,smtplib
+import hashlib,json,os,re,smtplib
 from datetime import datetime
 from email import policy
 from pathlib import Path
@@ -19,7 +19,66 @@ def atomic_json(path,value):
     with temp.open('w',encoding='utf-8') as f:json.dump(value,f,ensure_ascii=False,indent=2);f.flush();os.fsync(f.fileno())
     os.replace(temp,path)
 
-def submit(smtp,ledger,c,msg,cfg,test=False):
+def smtp_details(stage, code, reply, *, password='', message=None, raw=None):
+    response = reply.decode('utf-8', 'replace') if isinstance(reply, bytes) else str(reply or '')
+    codes = set(re.findall(r'(?m)^\s*(?:[245]\d\d[- ])?([245]\.\d{1,3}\.\d{1,3})(?=\s|$)', response))
+    enhanced = next(iter(codes)) if len(codes) == 1 else ''
+    if stage == 'AUTH':
+        response = '认证回复原文已省略' if response else ''
+    else:
+        if password:
+            response = response.replace(password, '[凭据已隐藏]')
+        if stage == 'DATA' and response and message is not None:
+            # Some servers quote submitted content in their diagnostics.
+            reply_text = ' '.join(response.casefold().split())
+            bodies = [raw.partition(b'\r\n\r\n')[2].decode('utf-8', 'replace')]
+            for part in message.walk():
+                if part.get_content_maintype() == 'text' and not part.is_multipart():
+                    try:
+                        bodies.append(part.get_content(errors='replace'))
+                    except (LookupError, ValueError):
+                        response = '邮件编码无法核对，回复原文已省略'
+                        break
+            if any(line.strip() and ' '.join(line.casefold().split()) in reply_text
+                   for body in bodies for line in body.splitlines()):
+                response = '回复包含邮件内容，原文已省略'
+    return dict(smtp_stage=stage, smtp_code=code or '', smtp_enhanced_code=enhanced, smtp_response=response)
+
+
+def smtp_summary(details):
+    codes = ' '.join(str(details[k]) for k in ('smtp_code', 'smtp_enhanced_code') if details.get(k))
+    return ' '.join(item for item in (details.get('smtp_stage'), codes) if item)
+
+
+def smtp_failure(details):
+    stage = details['smtp_stage']
+    code = details['smtp_code']
+    enhanced = details['smtp_enhanced_code']
+    reply = details['smtp_response'].casefold()
+    recipient_invalid = False
+    if stage == 'AUTH' or code in (530, 534, 535, 538):
+        reason = '发件账号认证失败，请核对凭据及 SMTP 权限'
+    elif re.search(r'\b(quota|daily limit|sending limit|mailbox full)\b|配额|超额', reply) or enhanced.endswith(('.2.2', '.3.1')):
+        reason = '服务器报告配额或存储上限，请核对服务商限制'
+    elif re.search(r'throttl|rate[ -]?limit|too many|限流|频率', reply):
+        reason = '服务器报告发送限流，请核对服务商限制'
+    elif enhanced == '4.7.0' or code == 421:
+        reason = '服务器暂时拒绝提交，可能限流或服务不可用'
+    elif enhanced[2:4] == '7.' or re.search(r'policy|blocked|策略', reply):
+        reason = '服务器策略拒收，请核对发件权限和服务商策略'
+    elif stage == 'RCPT TO' and code in (550, 553) and (
+        enhanced in ('5.1.1', '5.1.3') or re.fullmatch(
+            r'(?:recipient address rejected:\s*)?(?:user unknown|no such user|recipient address does not exist|invalid recipient address)[.!]?',
+            reply.strip())
+    ):
+        reason = '当前收件地址不存在或格式无效'
+        recipient_invalid = True
+    else:
+        reason = '服务器拒绝操作，影响范围待核查'
+    return f'{reason}（{smtp_summary(details)}）', recipient_invalid
+
+
+def submit(smtp,ledger,c,msg,cfg,test=False,*,password=''):
     raw=msg.as_bytes(policy=policy.SMTP)
     if any(p.get_content_disposition()=='inline' for p in msg.walk()):
         from v2_delivery import validate_inline
@@ -30,26 +89,47 @@ def submit(smtp,ledger,c,msg,cfg,test=False):
     dest=Path(cfg['storage'])/'data'/'attempts';dest.mkdir(parents=True,exist_ok=True)
     # Keep the ledger claim blocking if saving the wire intent itself fails.
     atomic_json(dest/f'{ident}-intent.json',r);(dest/f'{ident}.eml').write_bytes(raw)
-    response=None;original=smtp.data
-    def capture(data):
-        nonlocal response
-        response=original(data);return response
-    smtp.data=capture
+    response=None;final_data_reply=None;stage='SMTP 提交'
+    originals={}
+    def capture(command,original):
+        def run(*args,**kwargs):
+            nonlocal final_data_reply,stage
+            stage=command
+            reply=original(*args,**kwargs)
+            if command=='DATA':final_data_reply=reply
+            return reply
+        return run
     try:
+        for name,command in (('mail','MAIL FROM'),('rcpt','RCPT TO'),('data','DATA')):
+            original=getattr(smtp,name,None)
+            if original is not None:
+                originals[name]=original
+                setattr(smtp,name,capture(command,original))
         refused=smtp.sendmail(cfg['sender'],[c.email],raw)
         if refused:raise smtplib.SMTPRecipientsRefused(refused)
-        if not response or response[0]!=250:raise RuntimeError('未取得最终DATA 250响应')
+    except smtplib.SMTPRecipientsRefused as exc:
+        stage='RCPT TO'
+        response=exc.recipients.get(c.email)
+    except smtplib.SMTPResponseException as exc:
+        if isinstance(exc,smtplib.SMTPSenderRefused):stage='MAIL FROM'
+        if isinstance(exc,smtplib.SMTPDataError):stage='DATA'
+        if isinstance(exc,smtplib.SMTPAuthenticationError):stage='AUTH'
+        response=(exc.smtp_code,exc.smtp_error)
+    except Exception as exc:
+        r['smtp_error_type']=type(exc).__name__
+    finally:
+        for name,original in originals.items():setattr(smtp,name,original)
+    code,reply=final_data_reply or response or (None,None)
+    r.update(smtp_details(stage,code,reply,password=password,message=msg,raw=raw))
+    if final_data_reply and final_data_reply[0]==250:
         r['state']='accepted'
-    except (smtplib.SMTPRecipientsRefused,smtplib.SMTPSenderRefused,smtplib.SMTPDataError) as exc:
-        code=getattr(exc,'smtp_code',None)
-        if isinstance(exc,smtplib.SMTPRecipientsRefused):code=next((v[0] for v in exc.recipients.values()),None)
-        reason={'SMTPRecipientsRefused':'服务器拒绝收件人，请核对邮箱有效性或服务商策略','SMTPSenderRefused':'服务器拒绝发件账号，请核对发件权限','SMTPDataError':'服务器拒绝邮件内容或限流，请联系管理员核查'}[type(exc).__name__]
-        r.update(state='failed',reason=reason+(f'（{code}）' if code else ''),smtp_code=code or '',smtp_response=type(exc).__name__)
-    except Exception as exc:r.update(state='accepted' if response and response[0]==250 else 'unknown',reason=type(exc).__name__)
-    finally:smtp.data=original
-    if response:r.update(smtp_code=response[0],smtp_response=response[1].decode('utf-8','replace') if isinstance(response[1],bytes) else str(response[1]))
+    elif code is not None and 400 <= code < 600:
+        reason,recipient_invalid=smtp_failure(r)
+        r.update(state='failed',reason=reason,recipient_invalid=recipient_invalid)
+    else:
+        r['reason']=f'{stage} 阶段未能确认服务器是否接受邮件'
     r['finished']=now();state='test_accepted' if test and r['state']=='accepted' else r['state']
-    ledger.finish(ident,state,('服务器已接受（未确认客户收到）' if r['state']=='accepted' else r.get('reason',''))+f"；{r.get('smtp_code','')} {r.get('smtp_response','')}")
+    ledger.finish(ident,state,('服务器已接受（未确认客户收到）' if r['state']=='accepted' else r['reason'])+f"；{smtp_summary(r)} {r['smtp_response']}")
     atomic_json(dest/f'{ident}-result.json',r);return r
 
 def verify_copies(cfg,password,results):

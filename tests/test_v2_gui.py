@@ -1,7 +1,7 @@
 import json,tempfile,tkinter as tk,unittest,time
 from pathlib import Path
 from unittest.mock import patch,Mock
-from v2_model import DEFAULT,save_config,save_template
+from v2_model import DEFAULT,import_customers,save_config,save_template
 from v2_gui import Application
 from v2_engine import Controller
 from test_v2 import FastLease
@@ -56,5 +56,42 @@ class V2GuiTests(unittest.TestCase):
     def test_unsaved_template_edit_blocks_preview(self):
         app=self.app();app.tv['name'].set('Example');app.tv['subject'].set('Hello');app.body.insert('1.0','Example body');app.save_template_ui();app.body.insert('end',' changed')
         with self.assertRaises(ValueError):app.collect_cfg()
+
+    def test_continue_button_only_submits_pending_row(self):
+        app = self.app()
+        template_id = save_template(dict(name='Example', language='en', subject='Example',
+                                         format='text', body='Example body', attachments=[]), self.home)
+        source = Path(self.tmp.name)/'example.csv'
+        source.write_text('公司名称,邮箱\nOne,one@example.com\nTwo,two@example.com\nThree,three@example.com\n', encoding='utf-8')
+        cfg = import_customers(source, dict(app.cfg, template_id=template_id, sheet='CSV'), self.home)
+        self.controller.prepare(cfg)
+        app.password = 'SIMULATED'
+        states = iter(['accepted', 'unknown', 'accepted'])
+        recipients = []
+
+        class RecordingSMTP(FakeSMTP):
+            def sendmail(self, sender, targets, raw):
+                recipients.extend(targets)
+                return super().sendmail(sender, targets, raw)
+
+        self.controller.connector = lambda *_: RecordingSMTP(next(states))
+        self.controller.start(app.password)
+        self.controller.thread.join(5)
+        self.assertFalse(self.controller.busy)
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'ready'])
+
+        def children(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from children(child)
+
+        button = next(w for w in children(self.root) if w.winfo_class() == 'TButton' and w.cget('text') == '继续')
+        with patch.object(app, 'collect_cfg', return_value=cfg), patch('v2_gui.messagebox.askyesno', return_value=True) as confirm:
+            button.invoke()
+        confirm.assert_called_once()
+        self.controller.thread.join(5)
+        self.assertFalse(self.controller.busy)
+        self.assertEqual(recipients, ['one@example.com', 'two@example.com', 'three@example.com'])
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'accepted'])
 
 if __name__=='__main__':unittest.main()

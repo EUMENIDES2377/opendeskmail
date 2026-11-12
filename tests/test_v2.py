@@ -15,6 +15,30 @@ class FastLease:
     def reserve(self,interval=60):self.interval=interval;self.next_after=time.time()+.4
     def finished(self,interval=60):self.interval=interval;self.next_after=time.time()+.4
 
+class ScriptedSMTP(smtplib.SMTP):
+    """Exercise smtplib's envelope and DATA handling without opening a socket."""
+    def __init__(self, replies, commands):
+        super().__init__()
+        self.ehlo_resp = b'local test'
+        self.replies = iter(replies)
+        self.commands = commands
+
+    def putcmd(self, cmd, args=''):
+        self.commands.append((cmd.lower(), args))
+
+    def getreply(self):
+        reply = next(self.replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    def send(self, data):
+        self.commands.append(('body', ''))
+
+    def quit(self):
+        self.close()
+
+
 class V2Tests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name);self.home=self.root/'home';self.source=self.root/'customers.xlsx'
@@ -85,6 +109,8 @@ class V2Tests(unittest.TestCase):
         rows=self.controller.prepare(self.cfg);self.assertEqual(rows[0]['state'],'history')
     def test_failed_pauses_without_yellow(self):
         self.controller.connector=lambda *args:FakeSMTP('failed');self.controller.prepare(self.cfg);self.controller.start('simulated');self.finish();self.assertEqual(self.controller.snapshot()['counts']['failed'],1)
+        self.assertEqual(self.controller.status,'stopped');self.assertIn('RCPT TO 550',self.controller.last)
+        self.assertEqual(self.controller.job['rows'][0]['result']['smtp_response'],'rejected')
         b=load_workbook(self.controller.job['output']);self.assertNotEqual(b['Clients']['A2'].fill.fgColor.rgb,'FFFFFF00');self.assertIn('发送失败',b['Clients']['C2'].value);b.close()
     def test_excel_failure_does_not_change_accepted(self):
         self.controller.prepare(self.cfg)
@@ -114,6 +140,82 @@ class V2Tests(unittest.TestCase):
         class Throttled(FakeSMTP):
             def data(self,data):raise smtplib.SMTPDataError(421,b'throttle simulation')
         self.controller.connector=lambda *args:Throttled();self.controller.prepare(self.cfg);self.controller.start('simulation');self.finish();self.assertEqual(self.controller.snapshot()['counts']['failed'],1);self.assertEqual(self.controller.snapshot()['counts']['ready'],1);self.assertIn('421',self.controller.job['rows'][0]['reason'])
+    def scripted_batch(self, *sessions, cfg=None):
+        commands = []
+        sessions = iter(sessions)
+        self.controller.connector = lambda *_: ScriptedSMTP(next(sessions), commands)
+        self.controller.prepare(cfg or self.cfg)
+        self.controller.start('SIMULATED_SECRET')
+        self.finish()
+        return commands
+
+    def test_invalid_recipient_continues_at_normal_interval_and_counts_attempt(self):
+        ok = [(250, b'ok'), (250, b'ok'), (354, b'send data'), (250, b'2.0.0 queued')]
+        invalid = [(250, b'ok'), (550, b'5.1.1 User unknown\n5.1.1 Check address'), (250, b'reset')]
+        with patch.object(FastLease, 'finished', autospec=True, side_effect=FastLease.finished) as finished:
+            commands = self.scripted_batch(invalid, ok)
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['failed', 'accepted'])
+        self.assertEqual([call.args[1] for call in finished.call_args_list], [60, 60])
+        self.assertEqual(self.controller.snapshot()['today'], 2)
+        self.assertEqual([cmd for cmd, _ in commands].count('body'), 1)
+        result = json.loads((self.home/'data/attempts/1-result.json').read_text('utf-8'))
+        self.assertEqual((result['smtp_stage'], result['smtp_code'], result['smtp_enhanced_code']), ('RCPT TO', 550, '5.1.1'))
+        self.assertEqual(result['smtp_response'], '5.1.1 User unknown\n5.1.1 Check address')
+        self.assertIn('5.1.1 User unknown', (self.home/'logs/events.log').read_text('utf-8'))
+        with self.controller.ledger.connect() as db:
+            self.assertIn('当前收件地址不存在或格式无效', db.execute('SELECT detail FROM attempts WHERE id=1').fetchone()[0])
+
+    def test_sender_throttle_stops_and_manual_resume_skips_failed_attempt(self):
+        throttled = [(451, b'4.7.0 Sending rate limit exceeded SIMULATED_SECRET'), (250, b'reset')]
+        ok = [(250, b'ok'), (250, b'ok'), (354, b'send data'), (250, b'2.0.0 queued')]
+        commands = self.scripted_batch(throttled, ok)
+        self.assertEqual(self.controller.status, 'stopped')
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['failed', 'ready'])
+        self.assertIn('发送限流', self.controller.last)
+        self.assertIn('MAIL FROM 451 4.7.0', self.controller.last)
+        self.assertNotIn('SIMULATED_SECRET', (self.home/'logs/events.log').read_text('utf-8'))
+        self.assertNotIn('SIMULATED_SECRET', (self.home/'data/attempts/1-result.json').read_text('utf-8'))
+        self.controller.resume('SIMULATED_SECRET')
+        self.finish()
+        self.assertEqual([args for cmd, args in commands if cmd == 'rcpt'], ['TO:<two@example.com>'])
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['failed', 'accepted'])
+
+    def test_disconnect_after_data_stops_and_resume_skips_accepted_and_unknown(self):
+        book = load_workbook(self.source)
+        book['Clients'].append(['Example Three', 'three@example.com'])
+        book.save(self.source)
+        book.close()
+        cfg = import_customers(self.source, self.cfg, self.home)
+        prefix = [(250, b'ok'), (250, b'ok'), (354, b'send data')]
+        ok = prefix + [(250, b'2.0.0 queued')]
+        unknown = prefix + [smtplib.SMTPServerDisconnected('lost final reply')]
+        commands = self.scripted_batch(ok, unknown, ok, cfg=cfg)
+        self.assertEqual(self.controller.status, 'stopped')
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'ready'])
+        self.assertIn('DATA 阶段未能确认', self.controller.last)
+        self.assertEqual([cmd for cmd, _ in commands].count('body'), 2)
+        self.controller.resume('SIMULATED_SECRET')
+        self.finish()
+        self.assertEqual([args for cmd, args in commands if cmd == 'rcpt'],
+                         ['TO:<one@example.com>', 'TO:<two@example.com>', 'TO:<three@example.com>'])
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'accepted'])
+
+    def test_data_rejection_retains_codes_but_hides_quoted_body(self):
+        rejected = [(250, b'ok'), (250, b'ok'), (354, b'send data'),
+                    (550, b'5.7.1 Rejected content: Local example.'), (250, b'reset')]
+        self.scripted_batch(rejected)
+        self.assertEqual(self.controller.status, 'stopped')
+        result = self.controller.job['rows'][0]['result']
+        self.assertEqual(result['smtp_enhanced_code'], '5.7.1')
+        self.assertIn('策略拒收', result['reason'])
+        self.assertNotIn('Local example.', (self.home/'logs/events.log').read_text('utf-8'))
+        self.assertNotIn('Local example.', result['smtp_response'])
+
+    def test_250_before_body_is_not_treated_as_acceptance(self):
+        commands = self.scripted_batch([(250, b'ok'), (250, b'ok'), (250, b'unexpected before body'), (250, b'reset')])
+        self.assertEqual(self.controller.status, 'stopped')
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['unknown', 'ready'])
+        self.assertNotIn('body', [cmd for cmd, _ in commands])
     def test_language_mapping_typo_does_not_silently_fall_back(self):
         with self.assertRaises(ValueError):self.controller.prepare(dict(self.cfg,language_col='不存在的语言表头'))
     def test_ambiguous_language_templates_not_guessed(self):
