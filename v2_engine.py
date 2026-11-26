@@ -2,11 +2,11 @@
 import hashlib,json,queue,smtplib,threading,time,msvcrt,os
 from pathlib import Path
 from dataclasses import asdict
-from core import Customer,Ledger,read_customers,address_file,now,smtp_connect
+from core import Customer,Ledger,read_customers,address_file,now,smtp_connect,valid_email
 from account_guard import AccountLease
 from app_paths import DATA_ROOT
 from v2_model import HOME,STATES,templates,language,customer_fields,build_message,template_fingerprint,public_config,digest
-from v2_delivery import submit,atomic_json,verify_copies,ExcelResults,smtp_details,smtp_failure
+from v2_delivery import submit,atomic_json,verify_copies,ExcelResults,smtp_details,smtp_failure,serialize_message
 
 def explain(exc):
     import ssl
@@ -16,6 +16,10 @@ def explain(exc):
     if isinstance(exc,PermissionError):return '文件被占用或无写入权限。请关闭Excel后点击修复工作副本；已接受邮件不会重发。'
     if isinstance(exc,(ValueError,RuntimeError,InterruptedError)):return str(exc)
     return type(exc).__name__+'：操作已暂停，请核查本地记录或配置。'
+
+def local_error(exc):
+    return str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+
 
 class Results(ExcelResults):
     def __init__(self,cfg):
@@ -73,6 +77,27 @@ class Controller:
         with path.open('a',encoding='utf-8') as f:f.write(line+'\n')
     def save(self):
         if self.job:atomic_json(self.root/'data/job.json',self.job)
+    def log_row(self, row):
+        entry = dict(sheet=self.job['cfg']['sheet'], row=row['row'], company=row['company'],
+                     email=row['email'], result=STATES.get(row['state'], row['state']),
+                     reason=row.get('reason', ''))
+        entry.update({key: value for key, value in row.get('result', {}).items() if key.startswith('smtp_')})
+        self.log('客户处理 '+json.dumps(entry, ensure_ascii=False))
+
+    def skip_reason(self, row):
+        if not row['email'].strip():
+            return '收件邮箱为空'
+        if not valid_email(row['email']):
+            return '收件邮箱格式无效'
+        if not row['company'].strip():
+            return '公司名称为空'
+        return row.get('reason') or '客户字段无效'
+
+    def skip_row(self, row, reason):
+        row.update(state='skipped', reason=reason)
+        self.save()
+        self.log_row(row)
+
     def recover(self):
         # Orphaned claims never become ready merely because the process restarted.
         with self.ledger.connect() as db:
@@ -108,13 +133,23 @@ class Controller:
                             if len(matches)>1 and cfg['template_id'] not in matches:raise ValueError('该语言有多个模板，请明确选择对应模板或保留唯一匹配：'+str(lang))
                             row['template_id']=cfg['template_id'] if cfg['template_id'] in matches else matches[0]
                         build_message(c,fields[c.row],cfg,all_templates[row['template_id']])
-                    except Exception as exc:row.update(state='template_error',reason=explain(exc))
+                    except (ValueError, KeyError, TypeError, OSError) as exc:
+                        row.update(state='skipped', reason='无法生成邮件：'+local_error(exc))
+                elif row['state'] == 'invalid':
+                    row.update(state='skipped', reason=self.skip_reason(row))
                 rows.append(row)
             self.job=dict(cfg=cfg,rows=rows,templates=all_templates,template_hash=template_fingerprint(all_templates,cfg),source_hash=digest(cfg['file']),created=now(),batch_number=0)
-            reporter=Results(cfg);reporter.write();self.job['output']=str(reporter.path);self.status='prepared';self.save();self.log('预览已生成，未发送；工作副本：'+str(reporter.path));return rows
-    def message(self,row):
-        cfg=self.job['cfg'];fields=customer_fields(cfg);c=Customer(row['row'],row['company'],row['email'],row.get('note',''))
-        return build_message(c,fields[c.row],cfg,self.job['templates'][row['template_id']])
+            reporter=Results(cfg);reporter.write();self.job['output']=str(reporter.path);self.status='prepared';self.save();self.log('预览已生成，未发送；工作副本：'+str(reporter.path))
+            for row in rows:
+                if row['state'] == 'skipped':
+                    self.log_row(row)
+            return rows
+    def message(self, row, fields=None):
+        cfg = self.job['cfg']
+        if fields is None:
+            fields = customer_fields(cfg)
+        customer = Customer(row['row'], row['company'], row['email'], row.get('note',''))
+        return build_message(customer, fields[customer.row], cfg, self.job['templates'][row['template_id']])
     def check(self):
         if not self.job:raise ValueError('请先导入客户并生成预览。')
         cfg=self.job['cfg']
@@ -134,10 +169,11 @@ class Controller:
         else:self.start(password)
     def stop(self):
         self.stop_flag.set();self.pause_flag.clear();self.log('已请求安全停止；不会粗暴中断当前SMTP提交。')
-    def wait_boundary(self,lease):
+    def wait_boundary(self,lease=None):
         while True:
             if self.stop_flag.is_set():raise InterruptedError('已安全停止，未提交的客户保留待发送。')
             if self.pause_flag.is_set():self.status='paused';time.sleep(.1);continue
+            if lease is None:break
             self.countdown=max(0,int(lease.next_after-time.time()+.99))
             if not self.countdown:break
             self.status='waiting';self.stop_flag.wait(min(.2,max(0,lease.next_after-time.time())))
@@ -146,16 +182,42 @@ class Controller:
         cfg=self.job['cfg'];reporter=None;results=[];sent=0
         try:
             reporter=Results(cfg)
+            fields = customer_fields(cfg)
             with self.lease_factory(cfg['sender']) as lease:
                 for row in self.job['rows']:
-                    if row['state']!='ready':continue
-                    if sent>=cfg['batch']:break
-                    self.current=row['company'];self.current_email=row['email'];self.wait_boundary(lease);self.check()
-                    if cfg['cap'] and self.snapshot()['today']>=cfg['cap']:raise ValueError('已达到当日尝试上限；保留剩余客户，计数不会重置。')
-                    if row['email'] in self.ledger.blocked()|self.suppression():row.update(state='skipped',reason='发送前最新历史/拒收/回复名单已有记录');self.save();continue
-                    msg=self.message(row);self.wait_boundary(lease);lease.reserve(cfg['interval']);smtp=None
+                    if row['state'] in ('invalid', 'template_error'):
+                        self.wait_boundary()
+                        self.skip_row(row, self.skip_reason(row))
+                        continue
+                    if row['state'] != 'ready':continue
+                    if sent >= cfg['batch']:break
+                    self.current=row['company'];self.current_email=row['email'];self.wait_boundary();self.check()
+                    if not valid_email(row['email']) or not row['company'].strip():
+                        self.skip_row(row, self.skip_reason(row))
+                        continue
+                    if row['email'] in self.ledger.blocked() | self.suppression():
+                        self.skip_row(row, '发送前最新历史/拒收/回复名单已有记录')
+                        continue
                     try:
-                        self.status='submitting';self.log('正在提交：'+row['company']+' <'+row['email']+'>')
+                        msg = self.message(row, fields)
+                        raw = serialize_message(msg)
+                    except (ValueError, KeyError, TypeError, OSError) as exc:
+                        self.skip_row(row, '无法生成邮件：'+local_error(exc))
+                        continue
+                    if cfg['cap'] and self.snapshot()['today']>=cfg['cap']:raise ValueError('已达到当日尝试上限；保留剩余客户，计数不会重置。')
+                    self.wait_boundary(lease)
+                    self.check()
+                    smtp = None
+                    reserved = False
+
+                    def begin_submission():
+                        nonlocal reserved
+                        lease.reserve(cfg['interval'])
+                        reserved = True
+                        self.status = 'submitting'
+                        self.log('正在提交：'+row['company']+' <'+row['email']+'>')
+
+                    try:
                         try:smtp=self.connector(cfg,password)
                         except smtplib.SMTPResponseException as exc:
                             stage='AUTH' if isinstance(exc,smtplib.SMTPAuthenticationError) else getattr(exc,'smtp_stage','SMTP 连接')
@@ -163,20 +225,30 @@ class Controller:
                             reason,_=smtp_failure(details)
                             self.log('SMTP 连接诊断 '+json.dumps(details,ensure_ascii=False))
                             raise InterruptedError(reason+'，已暂停本批。') from exc
-                        result=submit(smtp,self.ledger,Customer(row['row'],row['company'],row['email']),msg,cfg,password=password)
+                        self.wait_boundary()
+                        self.check()
+                        result = submit(smtp, self.ledger, Customer(row['row'], row['company'], row['email']),
+                                        msg, cfg, password=password, raw=raw, before_submission=begin_submission)
                     finally:
-                        lease.finished(cfg['interval'])
+                        if reserved:
+                            lease.finished(cfg['interval'])
                         if smtp:
                             try:smtp.quit()
                             except Exception:smtp.close()
-                    row.update(state=result['state'],result=result,reason=result.get('reason',''));sent+=1;self.job['batch_processed']=sent;results.append(result);self.last=row['company']+'：'+STATES.get(row['state'],row['state']);self.save();self.log(self.last)
-                    if result['state'] in ('failed','unknown'):
-                        diagnostic={key:value for key,value in result.items() if key.startswith('smtp_')}
-                        self.log(f"SMTP 尝试 #{result['attempt_id']} {result['reason']} "+json.dumps(diagnostic,ensure_ascii=False))
+                    if result['state'] == 'skipped':
+                        self.skip_row(row, '提交前最新记录已禁止重复发送')
+                        continue
+                    row.update(state=result['state'], result=result, reason=result.get('reason', ''))
+                    sent += 1
+                    self.job['batch_processed'] = sent
+                    results.append(result)
+                    self.last = row['company']+'：'+STATES.get(row['state'], row['state'])
+                    self.save()
+                    self.log_row(row)
                     try:reporter.record(result)
                     except Exception as exc:
                         self.job['excel_error']=explain(exc);self.save();raise ValueError('邮件结果已写入数据库；Excel保存失败，请修复副本，禁止因此重发。')
-                    if result['state']=='unknown' or (result['state']=='failed' and not result.get('recipient_invalid')):
+                    if result.get('stop_batch'):
                         raise InterruptedError(result['reason']+'，已暂停本批；不会自动重试。')
                 self.status='completed' if not any(r['state']=='ready' for r in self.job['rows']) else 'batch_done'
         except Exception as exc:
@@ -186,7 +258,9 @@ class Controller:
             for ident,email,mid in uncertain:
                 self.ledger.finish(ident,'unknown','提交操作中断，结果待核实，禁止自动重试')
                 for row in self.job['rows']:
-                    if row['email']==email and row['state']=='ready':row.update(state='unknown',reason='持久提交意图存在，结果待核实')
+                    if row['email']==email and row['state']=='ready':
+                        row.update(state='unknown',reason='持久提交意图存在，结果待核实')
+                        self.log_row(row)
         finally:
             if results:
                 try:

@@ -71,7 +71,7 @@ class V2Tests(unittest.TestCase):
     def test_language_matches_existing_local_templates(self):
         cfg=dict(self.cfg,language_col='语言');rows=self.controller.prepare(cfg);self.assertEqual([r['template_id'] for r in rows],[self.ids['en'],self.ids['es']])
     def test_unknown_language_held(self):
-        b=load_workbook(self.cfg['file']);b['Clients']['D3']='not-configured';b.save(self.cfg['file']);b.close();rows=self.controller.prepare(dict(self.cfg,language_col='语言'));self.assertEqual(rows[1]['state'],'template_error')
+        b=load_workbook(self.cfg['file']);b['Clients']['D3']='not-configured';b.save(self.cfg['file']);b.close();rows=self.controller.prepare(dict(self.cfg,language_col='语言'));self.assertEqual(rows[1]['state'],'skipped')
     def test_unknown_and_missing_variables_block(self):
         item=templates(self.home)[self.ids['en']];c=Customer(2,'Example','one@example.com')
         for text in ('{{missing}}','{{note}}','{{company | upper}}','{% include x %}'):
@@ -104,12 +104,12 @@ class V2Tests(unittest.TestCase):
     def test_daily_cap_does_not_reset(self):
         self.controller.prepare(dict(self.cfg,cap=1));self.controller.start('simulated');self.finish();self.assertEqual(sum(s.calls for s in self.smtp),1);self.assertEqual(self.controller.snapshot()['today'],1)
         self.controller.start('simulated');self.finish();self.assertEqual(sum(s.calls for s in self.smtp),1)
-    def test_unknown_pauses_and_is_never_retried(self):
-        self.controller.connector=lambda *args:FakeSMTP('unknown');self.controller.prepare(self.cfg);self.controller.start('simulated');self.finish();self.assertEqual(self.controller.snapshot()['counts']['unknown'],1);self.assertEqual(self.controller.snapshot()['counts']['ready'],1)
+    def test_unknown_continues_and_is_never_retried(self):
+        self.controller.connector=lambda *args:FakeSMTP('unknown');self.controller.prepare(self.cfg);self.controller.start('simulated');self.finish();self.assertEqual(self.controller.snapshot()['counts']['unknown'],2);self.assertEqual(self.controller.snapshot()['counts']['ready'],0)
         rows=self.controller.prepare(self.cfg);self.assertEqual(rows[0]['state'],'history')
-    def test_failed_pauses_without_yellow(self):
-        self.controller.connector=lambda *args:FakeSMTP('failed');self.controller.prepare(self.cfg);self.controller.start('simulated');self.finish();self.assertEqual(self.controller.snapshot()['counts']['failed'],1)
-        self.assertEqual(self.controller.status,'stopped');self.assertIn('RCPT TO 550',self.controller.last)
+    def test_recipient_failure_continues_without_yellow(self):
+        self.controller.connector=lambda *args:FakeSMTP('failed');self.controller.prepare(self.cfg);self.controller.start('simulated');self.finish();self.assertEqual(self.controller.snapshot()['counts']['failed'],2)
+        self.assertEqual(self.controller.status,'completed');self.assertIn('RCPT TO 550',self.controller.job['rows'][0]['reason'])
         self.assertEqual(self.controller.job['rows'][0]['result']['smtp_response'],'rejected')
         b=load_workbook(self.controller.job['output']);self.assertNotEqual(b['Clients']['A2'].fill.fgColor.rgb,'FFFFFF00');self.assertIn('发送失败',b['Clients']['C2'].value);b.close()
     def test_excel_failure_does_not_change_accepted(self):
@@ -132,6 +132,19 @@ class V2Tests(unittest.TestCase):
     def test_csv_working_copy_created_and_updated(self):
         path=self.root/'sample.csv';path.write_text('公司名称,邮箱,备注\nExample,one@example.com,Keep\n',encoding='utf-8');cfg=import_customers(path,dict(self.cfg,sheet='CSV'),self.home);before=path.read_bytes();self.controller.prepare(cfg)
         self.assertTrue(Path(self.controller.job['output']).is_file());self.controller.start('simulation');self.finish();text=Path(self.controller.job['output']).read_text('utf-8-sig');self.assertIn('发送邮件开发信',text);self.assertEqual(before,path.read_bytes())
+    def test_unavailable_smtp_stops_without_claiming_any_customer(self):
+        def unavailable(*args):
+            raise smtplib.SMTPConnectError(421, b'Service not available')
+
+        self.controller.connector = unavailable
+        self.controller.prepare(self.cfg)
+        self.controller.start('simulated')
+        self.finish()
+        self.assertEqual(self.controller.status, 'stopped')
+        self.assertEqual(self.controller.snapshot()['today'], 0)
+        self.assertEqual([row['state'] for row in self.controller.job['rows']], ['ready', 'ready'])
+        self.assertIn('421', self.controller.last)
+
     def test_auth_failure_stops_after_one_connection(self):
         calls=[]
         def reject(*args):calls.append(1);raise smtplib.SMTPAuthenticationError(535,b'FAKE_SECRET_MUST_NOT_LOG')
@@ -148,6 +161,75 @@ class V2Tests(unittest.TestCase):
         self.controller.start('SIMULATED_SECRET')
         self.finish()
         return commands
+
+    def test_mixed_excel_queue_skips_local_errors_and_finishes_without_intervention(self):
+        book = load_workbook(self.source)
+        sheet = book['Clients']
+        sheet.delete_rows(2, 2)
+        for company, address in [('First', 'first@example.com'), ('Empty', ''),
+                                 ('Invalid', 'bad-address'), ('Refused', 'refused@example.com'),
+                                 ('Last', 'last@example.com')]:
+            sheet.append([company, address])
+        book.save(self.source)
+        book.close()
+        cfg = import_customers(self.source, self.cfg, self.home)
+        ok = [(250, b'ok'), (250, b'ok'), (354, b'data'), (250, b'queued')]
+        refused = [(250, b'ok'), (550, b'5.7.1 Recipient address rejected: access denied'), (250, b'reset')]
+        with patch.object(FastLease, 'reserve', autospec=True, side_effect=FastLease.reserve) as reserve:
+            commands = self.scripted_batch(ok, refused, ok, cfg=cfg)
+        self.assertEqual(self.controller.status, 'completed')
+        self.assertEqual([r['state'] for r in self.controller.job['rows']],
+                         ['accepted', 'skipped', 'skipped', 'failed', 'accepted'])
+        self.assertEqual(self.controller.snapshot()['counts'],
+                         dict(ready=0, accepted=2, failed=1, unknown=0, skipped=2))
+        self.assertEqual(self.controller.snapshot()['today'], 3)
+        self.assertEqual([call.args[1] for call in reserve.call_args_list], [60, 60, 60])
+        self.assertEqual([args for cmd, args in commands if cmd == 'rcpt'],
+                         ['TO:<first@example.com>', 'TO:<refused@example.com>', 'TO:<last@example.com>'])
+        lines = (self.home/'logs/events.log').read_text('utf-8').splitlines()
+        entries = {entry['row']: entry for line in lines if '客户处理 ' in line
+                   for entry in [json.loads(line.split('客户处理 ', 1)[1])]}
+        self.assertEqual(set(entries), {2, 3, 4, 5, 6})
+        self.assertEqual(entries[3]['reason'], '收件邮箱为空')
+        self.assertEqual(entries[4]['reason'], '收件邮箱格式无效')
+        self.assertEqual(entries[5]['smtp_code'], 550)
+        self.assertEqual(entries[5]['smtp_response'], '5.7.1 Recipient address rejected: access denied')
+        self.assertEqual(entries[6]['company'], 'Last')
+
+    def test_duplicate_claim_skip_does_not_reserve_an_interval(self):
+        self.controller.prepare(self.cfg)
+        claim = self.controller.ledger.claim
+
+        def claim_one(sender, customer, *args, **kwargs):
+            if customer.row == 2:
+                return None
+            return claim(sender, customer, *args, **kwargs)
+
+        with patch.object(self.controller.ledger, 'claim', side_effect=claim_one), \
+             patch.object(FastLease, 'reserve', autospec=True, side_effect=FastLease.reserve) as reserve:
+            self.controller.start('simulated')
+            self.finish()
+        self.assertEqual([row['state'] for row in self.controller.job['rows']], ['skipped', 'accepted'])
+        self.assertEqual(self.controller.snapshot()['today'], 1)
+        self.assertEqual(reserve.call_count, 1)
+        self.assertEqual(sum(s.calls for s in self.smtp), 1)
+
+    def test_runtime_render_failure_skips_without_using_attempt_or_interval(self):
+        self.controller.prepare(self.cfg)
+        render = self.controller.message
+
+        def render_one(row, fields):
+            if row['row'] == 2:
+                raise ValueError('模拟收件人字段缺失')
+            return render(row, fields)
+
+        with patch.object(self.controller, 'message', side_effect=render_one):
+            self.controller.start('simulated')
+            self.finish()
+        self.assertEqual([row['state'] for row in self.controller.job['rows']], ['skipped', 'accepted'])
+        self.assertEqual(self.controller.snapshot()['today'], 1)
+        self.assertEqual(sum(s.calls for s in self.smtp), 1)
+        self.assertIn('模拟收件人字段缺失', ''.join(self.controller.logs))
 
     def test_invalid_recipient_continues_at_normal_interval_and_counts_attempt(self):
         ok = [(250, b'ok'), (250, b'ok'), (354, b'send data'), (250, b'2.0.0 queued')]
@@ -180,7 +262,7 @@ class V2Tests(unittest.TestCase):
         self.assertEqual([args for cmd, args in commands if cmd == 'rcpt'], ['TO:<two@example.com>'])
         self.assertEqual([r['state'] for r in self.controller.job['rows']], ['failed', 'accepted'])
 
-    def test_disconnect_after_data_stops_and_resume_skips_accepted_and_unknown(self):
+    def test_disconnect_after_data_continues_without_retry(self):
         book = load_workbook(self.source)
         book['Clients'].append(['Example Three', 'three@example.com'])
         book.save(self.source)
@@ -190,15 +272,19 @@ class V2Tests(unittest.TestCase):
         ok = prefix + [(250, b'2.0.0 queued')]
         unknown = prefix + [smtplib.SMTPServerDisconnected('lost final reply')]
         commands = self.scripted_batch(ok, unknown, ok, cfg=cfg)
-        self.assertEqual(self.controller.status, 'stopped')
-        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'ready'])
-        self.assertIn('DATA 阶段未能确认', self.controller.last)
-        self.assertEqual([cmd for cmd, _ in commands].count('body'), 2)
-        self.controller.resume('SIMULATED_SECRET')
-        self.finish()
+        self.assertEqual(self.controller.status, 'completed')
+        self.assertIn('DATA 阶段未能确认', self.controller.job['rows'][1]['reason'])
+        self.assertEqual([cmd for cmd, _ in commands].count('body'), 3)
         self.assertEqual([args for cmd, args in commands if cmd == 'rcpt'],
                          ['TO:<one@example.com>', 'TO:<two@example.com>', 'TO:<three@example.com>'])
         self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'accepted'])
+        self.controller.close()
+        self.controller = Controller(self.home, connector=lambda *_: self.fail('unexpected SMTP connection'),
+                                     lease_factory=FastLease)
+        self.assertFalse(self.controller.busy)
+        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'accepted'])
+        with self.assertRaisesRegex(ValueError, '没有未尝试'):
+            self.controller.start('SIMULATED_SECRET')
 
     def test_data_rejection_retains_codes_but_hides_quoted_body(self):
         rejected = [(250, b'ok'), (250, b'ok'), (354, b'send data'),
@@ -220,7 +306,7 @@ class V2Tests(unittest.TestCase):
         with self.assertRaises(ValueError):self.controller.prepare(dict(self.cfg,language_col='不存在的语言表头'))
     def test_ambiguous_language_templates_not_guessed(self):
         save_template(dict(name='Another Spanish',language='es',subject='Another',format='text',body='Other content',attachments=[]),self.home)
-        rows=self.controller.prepare(dict(self.cfg,language_col='语言'));self.assertEqual(rows[1]['state'],'template_error');self.assertIn('多个模板',rows[1]['reason'])
+        rows=self.controller.prepare(dict(self.cfg,language_col='语言'));self.assertEqual(rows[1]['state'],'skipped');self.assertIn('多个模板',rows[1]['reason'])
     def test_literal_field_names_with_spaces_are_supported(self):
         self.assertEqual(merge('Hello {{ Contact Name }}',{'Contact Name':'Example Person'}),'Hello Example Person')
         with self.assertRaises(ValueError):merge('{{ company.upper() }}',{'company':'Example'})

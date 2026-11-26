@@ -61,7 +61,7 @@ class V2GuiTests(unittest.TestCase):
         app=self.app();app.tv['name'].set('Example');app.tv['subject'].set('Hello');app.body.insert('1.0','Example body');app.save_template_ui();app.body.insert('end',' changed')
         with self.assertRaises(ValueError):app.collect_cfg()
 
-    def test_continue_button_only_submits_pending_row(self):
+    def test_unknown_result_continues_without_confirmation(self):
         app = self.app()
         template_id = save_template(dict(name='Example', language='en', subject='Example',
                                          format='text', body='Example body', attachments=[]), self.home)
@@ -80,19 +80,6 @@ class V2GuiTests(unittest.TestCase):
 
         self.controller.connector = lambda *_: RecordingSMTP(next(states))
         self.controller.start(app.password)
-        self.controller.thread.join(5)
-        self.assertFalse(self.controller.busy)
-        self.assertEqual([r['state'] for r in self.controller.job['rows']], ['accepted', 'unknown', 'ready'])
-
-        def children(widget):
-            for child in widget.winfo_children():
-                yield child
-                yield from children(child)
-
-        button = next(w for w in children(self.root) if w.winfo_class() == 'TButton' and w.cget('text') == '继续')
-        with patch.object(app, 'collect_cfg', return_value=cfg), patch('v2_gui.messagebox.askyesno', return_value=True) as confirm:
-            button.invoke()
-        confirm.assert_called_once()
         self.controller.thread.join(5)
         self.assertFalse(self.controller.busy)
         self.assertEqual(recipients, ['one@example.com', 'two@example.com', 'three@example.com'])

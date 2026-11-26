@@ -55,15 +55,23 @@ def smtp_failure(details):
     code = details['smtp_code']
     enhanced = details['smtp_enhanced_code']
     reply = details['smtp_response'].casefold()
-    recipient_invalid = False
+    message_scoped = False
     if stage == 'AUTH' or code in (530, 534, 535, 538):
         reason = '发件账号认证失败，请核对凭据及 SMTP 权限'
-    elif re.search(r'\b(quota|daily limit|sending limit|mailbox full)\b|配额|超额', reply) or enhanced.endswith(('.2.2', '.3.1')):
+    elif re.search(r'\b(quota|daily limit|sending limit)\b|配额|超额|限发', reply) or enhanced.endswith('.3.1'):
         reason = '服务器报告配额或存储上限，请核对服务商限制'
     elif re.search(r'throttl|rate[ -]?limit|too many|限流|频率', reply):
         reason = '服务器报告发送限流，请核对服务商限制'
     elif enhanced == '4.7.0' or code == 421:
         reason = '服务器暂时拒绝提交，可能限流或服务不可用'
+    elif stage in ('RCPT TO', 'DATA') and (enhanced.endswith('.2.2') or re.search(r'\bmailbox full\b', reply)):
+        reason = '当前收件邮箱已满'
+        message_scoped = True
+    elif re.search(r'\b(?:sender|sending account|account)(?: address)? (?:is |has been )?(?:blocked|disabled|suspended|rejected|not authorized|not allowed)\b|发件账号.*(?:禁用|停用|受限)', reply):
+        reason = '服务器限制当前发件账号，请核对账号状态和发送权限'
+    elif stage == 'RCPT TO' and re.search(r'recipient(?: address)? (?:rejected|blocked)|收件人被拒绝', reply):
+        reason = '服务器拒绝当前收件人'
+        message_scoped = True
     elif enhanced[2:4] == '7.' or re.search(r'policy|blocked|策略', reply):
         reason = '服务器策略拒收，请核对发件权限和服务商策略'
     elif stage == 'RCPT TO' and code in (550, 553) and (
@@ -72,21 +80,34 @@ def smtp_failure(details):
             reply.strip())
     ):
         reason = '当前收件地址不存在或格式无效'
-        recipient_invalid = True
+        message_scoped = True
+    elif stage == 'RCPT TO':
+        reason = '服务器拒绝当前收件人'
+        message_scoped = True
+    elif stage == 'DATA' and (enhanced[2:4] == '6.' or enhanced.endswith('.3.4') or
+                              re.search(r'message (?:too large|size exceeds)|邮件过大', reply)):
+        reason = '服务器拒绝当前邮件的内容或大小'
+        message_scoped = True
     else:
         reason = '服务器拒绝操作，影响范围待核查'
-    return f'{reason}（{smtp_summary(details)}）', recipient_invalid
+    return f'{reason}（{smtp_summary(details)}）', message_scoped
 
 
-def submit(smtp,ledger,c,msg,cfg,test=False,*,password=''):
-    raw=msg.as_bytes(policy=policy.SMTP)
-    if any(p.get_content_disposition()=='inline' for p in msg.walk()):
-        from v2_delivery import validate_inline
+def serialize_message(msg):
+    if any(part.get_content_disposition() == 'inline' for part in msg.walk()):
         validate_inline(msg)
+    return msg.as_bytes(policy=policy.SMTP)
+
+
+def submit(smtp,ledger,c,msg,cfg,test=False,*,password='',raw=None,before_submission=None):
+    if raw is None:
+        raw = serialize_message(msg)
     ident=ledger.claim(cfg['sender'],c,str(msg['Subject']),cfg['cap'],str(msg['Message-ID']),test=test)
     if ident is None:return {'state':'skipped','row':c.row,'company':c.company,'email':c.email}
     r=dict(attempt_id=ident,row=c.row,company=c.company,email=c.email,subject=str(msg['Subject']),message_id=str(msg['Message-ID']),started=now(),state='unknown',is_test=test)
     dest=Path(cfg['storage'])/'data'/'attempts';dest.mkdir(parents=True,exist_ok=True)
+    if before_submission is not None:
+        before_submission()
     # Keep the ledger claim blocking if saving the wire intent itself fails.
     atomic_json(dest/f'{ident}-intent.json',r);(dest/f'{ident}.eml').write_bytes(raw)
     response=None;final_data_reply=None;stage='SMTP 提交'
@@ -124,10 +145,11 @@ def submit(smtp,ledger,c,msg,cfg,test=False,*,password=''):
     if final_data_reply and final_data_reply[0]==250:
         r['state']='accepted'
     elif code is not None and 400 <= code < 600:
-        reason,recipient_invalid=smtp_failure(r)
-        r.update(state='failed',reason=reason,recipient_invalid=recipient_invalid)
+        reason, message_scoped = smtp_failure(r)
+        r.update(state='failed', reason=reason, stop_batch=not message_scoped)
     else:
         r['reason']=f'{stage} 阶段未能确认服务器是否接受邮件'
+        r['stop_batch'] = bool(code) or stage in ('AUTH', 'MAIL FROM', 'RCPT TO')
     r['finished']=now();state='test_accepted' if test and r['state']=='accepted' else r['state']
     ledger.finish(ident,state,('服务器已接受（未确认客户收到）' if r['state']=='accepted' else r['reason'])+f"；{smtp_summary(r)} {r['smtp_response']}")
     atomic_json(dest/f'{ident}-result.json',r);return r
