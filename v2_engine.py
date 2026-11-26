@@ -49,14 +49,14 @@ class Results(ExcelResults):
         self.persist()
 
 class Controller:
-    def __init__(self,root=HOME,connector=smtp_connect,lease_factory=None,copy_checker=verify_copies):
+    def __init__(self,root=HOME,connector=smtp_connect,lease_factory=None,copy_checker=verify_copies, ledger_path=None, project='default'):
         self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True)
         self.instance=(self.root/'instance.lock').open('a+b');self.instance.seek(0)
         if (self.root/'instance.lock').stat().st_size==0:self.instance.write(b'0');self.instance.flush()
         self.instance.seek(0)
         try:msvcrt.locking(self.instance.fileno(),msvcrt.LK_NBLCK,1)
         except OSError:self.instance.close();raise ValueError('此独立工作区已有程序窗口，请使用现有窗口，不能多开任务。')
-        self.ledger=Ledger(self.root/'data/history.sqlite3');self.connector=connector;self.copy_checker=copy_checker
+        self.ledger=Ledger(ledger_path or self.root/'data/history.sqlite3', project);self.connector=connector;self.copy_checker=copy_checker
         self.lease_factory=lease_factory or (lambda sender:AccountLease(sender,DATA_ROOT/'locks'))
         self.events=queue.Queue();self.lock=threading.RLock();self.pause_flag=threading.Event();self.stop_flag=threading.Event();self.thread=None;self.job=None
         self.status='idle';self.current='';self.current_email='';self.last='';self.countdown=0;self.logs=[]
@@ -76,11 +76,11 @@ class Controller:
     def recover(self):
         # Orphaned claims never become ready merely because the process restarted.
         with self.ledger.connect() as db:
-            db.execute("UPDATE attempts SET state='unknown',finished=?,detail=coalesce(detail,'')||'；进程中断，禁止自动重试' WHERE state='sending'",(now(),))
+            db.execute("UPDATE attempts SET state='unknown',finished=?,detail=coalesce(detail,'')||'；进程中断，禁止自动重试' WHERE state='sending' AND project=?",(now(),self.ledger.project))
         path=self.root/'data/job.json'
         if not path.exists():return
         self.job=json.loads(path.read_text('utf-8'));self.status='stopped'
-        with self.ledger.connect() as db:records=list(db.execute('SELECT id,email,state,started,finished,message_id,company,subject,is_test FROM attempts ORDER BY id'))
+        with self.ledger.connect() as db:records=list(db.execute('SELECT id,email,state,started,finished,message_id,company,subject,is_test FROM attempts WHERE project=? ORDER BY id', (self.ledger.project,)))
         byemail={r[1]:r for r in records if not r[8]}
         for row in self.job['rows']:
             if row['email'] in byemail and row['state'] not in ('yellow','duplicate','invalid','blocked','history','template_error','skipped'):
@@ -182,7 +182,7 @@ class Controller:
         except Exception as exc:
             self.status='stopped';self.last=explain(exc);self.log(self.last)
             with self.ledger.connect() as db:
-                uncertain=list(db.execute("SELECT id,email,message_id FROM attempts WHERE state='sending' AND is_test=0"))
+                uncertain=list(db.execute("SELECT id,email,message_id FROM attempts WHERE state='sending' AND is_test=0 AND project=?", (self.ledger.project,)))
             for ident,email,mid in uncertain:
                 self.ledger.finish(ident,'unknown','提交操作中断，结果待核实，禁止自动重试')
                 for row in self.job['rows']:
@@ -208,5 +208,5 @@ class Controller:
     def snapshot(self,sender=None):
         rows=self.job['rows'] if self.job else [];counts={k:sum(r['state']==k for r in rows) for k in ('ready','accepted','failed','unknown')};counts['skipped']=sum(r['state'] not in ('ready','accepted','failed','unknown','sending') for r in rows)
         sender=sender or (self.job['cfg']['sender'] if self.job else '')
-        with self.ledger.connect() as db:today=db.execute('SELECT count(*) FROM attempts WHERE sender=? AND substr(started,1,10)=?',(sender,now()[:10])).fetchone()[0]
+        with self.ledger.connect() as db:today=db.execute('SELECT count(*) FROM attempts WHERE sender=? AND substr(started,1,10)=? AND state!=?',(sender,now()[:10],'manual')).fetchone()[0]
         return dict(total=len(rows),counts=counts,status=self.status,current=self.current,email=self.current_email,last=self.last,countdown=self.countdown,today=today,batch=self.job.get('batch_number',0) if self.job else 0)

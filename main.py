@@ -4,7 +4,7 @@ from tkinter import messagebox
 from v2_gui import Application
 def main():
     root=tk.Tk()
-    try:Application(root)
+    try:Application(root, enable_projects=True)
     except Exception as exc:messagebox.showerror('无法启动',str(exc),parent=root);root.destroy();return
     root.mainloop()
 if __name__=='__main__':main()

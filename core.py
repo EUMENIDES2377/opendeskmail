@@ -130,14 +130,18 @@ def read_customers(path, sheet, company_col='公司名', email_col='邮箱', not
     return result
 
 class Ledger:
-    def __init__(self, path):
+    def __init__(self, path, project='default'):
         self.path = Path(path)
+        self.project = project
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             db.execute('CREATE TABLE IF NOT EXISTS attempts (id INTEGER PRIMARY KEY, sender TEXT, email TEXT, company TEXT, subject TEXT, state TEXT, started TEXT, finished TEXT, detail TEXT, message_id TEXT)')
             columns = {row[1] for row in db.execute('PRAGMA table_info(attempts)')}
             if 'is_test' not in columns:
                 db.execute('ALTER TABLE attempts ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0')
+            if 'project' not in columns:
+                db.execute("ALTER TABLE attempts ADD COLUMN project TEXT NOT NULL DEFAULT 'default'")
             if 'test_key' not in columns:
                 db.execute('ALTER TABLE attempts ADD COLUMN test_key TEXT')
             db.execute('CREATE UNIQUE INDEX IF NOT EXISTS unique_test_key ON attempts(test_key) WHERE test_key IS NOT NULL')
@@ -165,8 +169,8 @@ class Ledger:
             count = db.execute("SELECT COUNT(*) FROM attempts WHERE sender=? AND substr(started,1,10)=? AND state!='manual'", (sender, now()[:10])).fetchone()[0]
             if cap and count >= cap:
                 raise ValueError('已达到今天的发送尝试上限（北京时间，含失败和测试邮件）。')
-            cur = db.execute('INSERT INTO attempts(sender,email,company,subject,state,started,message_id,is_test,test_key) VALUES(?,?,?,?,?,?,?,?,?)',
-                             (sender, customer.email, customer.company, subject, 'sending', now(), message_id, int(test), test_key))
+            cur = db.execute('INSERT INTO attempts(sender,email,company,subject,state,started,message_id,is_test,test_key,project) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                             (sender, customer.email, customer.company, subject, 'sending', now(), message_id, int(test), test_key, self.project))
             return cur.lastrowid
 
     def finish(self, ident, state, detail=''):
@@ -175,7 +179,7 @@ class Ledger:
 
     def rows(self):
         with self.connect() as db:
-            return list(db.execute('SELECT started,email,company,subject,state,detail,message_id FROM attempts ORDER BY id'))
+            return list(db.execute('SELECT started,email,company,subject,state,detail,message_id FROM attempts WHERE project=? ORDER BY id', (self.project,)))
 
     def archive_result(self, ident, detail):
         with self.connect() as db:

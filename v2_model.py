@@ -34,6 +34,89 @@ def validate_account(cfg):
     cfg['sender']=normalize(cfg['sender']);return cfg
 def save_config(cfg,root=HOME):atomic_json(Path(root)/'config/settings.json',public_config(cfg))
 
+SHARED_ACCOUNT_FIELDS = (
+    'sender', 'sender_name', 'host', 'port', 'security', 'username', 'credential_kind',
+    'interval', 'batch', 'cap', 'imap_host', 'imap_port', 'imap_security', 'imap_sent_folder',
+)
+
+
+class ProjectProfiles:
+    """Keep the existing project's paths and share its account settings and ledger."""
+
+    default = 'default'
+
+    def __init__(self, root):
+        import msvcrt
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = (self.root / 'projects.lock').open('a+b')
+        try:
+            if self.lock.tell() == 0:
+                self.lock.write(b'0')
+                self.lock.flush()
+            self.lock.seek(0)
+            msvcrt.locking(self.lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            self.close()
+            raise ValueError('此账号的项目窗口已打开，请使用现有窗口。') from None
+        self.index = self.root / 'config/projects.json'
+        self.ledger = self.root / 'data/history.sqlite3'
+        try:
+            if self.index.exists():
+                index = json.loads(self.index.read_text('utf-8'))
+                self.names = index['names']
+                self.active = index['active']
+                self.home(self.active)
+            else:
+                name = load_config(self.root)['market'] or '默认项目'
+                self.names = {self.default: name}
+                self.select(self.default)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        self.lock.close()
+
+    def home(self, project):
+        if project not in self.names or not re.fullmatch(r'[a-z0-9-]+', project):
+            raise ValueError('未知发送项目。')
+        return self.root if project == self.default else self.root / 'projects' / project
+
+    def select(self, project):
+        self.home(project)
+        atomic_json(self.index, {'active': project, 'names': self.names})
+        self.active = project
+
+    def create(self, name):
+        from uuid import uuid4
+        name = name.strip()
+        if not name or len(name) > 80 or any(c in name for c in '\r\n'):
+            raise ValueError('项目名称须为 1–80 个字符。')
+        if name.casefold() in {item.casefold() for item in self.names.values()}:
+            raise ValueError('已存在同名发送项目。')
+        project = uuid4().hex
+        self.names[project] = name
+        try:
+            self.select(self.active)
+        except Exception:
+            del self.names[project]
+            raise
+        return project
+
+    def save_account(self, cfg):
+        account = load_config(self.root)
+        account.update({key: cfg[key] for key in SHARED_ACCOUNT_FIELDS})
+        save_config(account, self.root)
+
+    def config(self, project):
+        cfg = load_config(self.home(project))
+        account = load_config(self.root)
+        cfg.update({key: account[key] for key in SHARED_ACCOUNT_FIELDS})
+        cfg['market'] = cfg['market'] or self.names[project]
+        return cfg
+
+
 class SecureStore(CredentialStore):
     @staticmethod
     def target(cfg):return 'OpenDeskMail/SMTP/v1/'+CredentialStore.target(cfg).rsplit('/',1)[-1]

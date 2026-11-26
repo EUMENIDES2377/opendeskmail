@@ -2,27 +2,167 @@
 import json,queue,threading,webbrowser,os
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk,filedialog,messagebox
+from tkinter import ttk,filedialog,messagebox,simpledialog
 from email.utils import getaddresses
 from core import BASE,Customer,Ledger,now,sheet_names,export_csv,smtp_connect
 from html_signature import preview_document
-from v2_model import HOME,DEFAULT,STATES,load_config,save_config,validate_account,SecureStore,templates,save_template,import_html,paste_html,import_customers,build_message,customer_fields,language,public_config,decode_html,protect_source
+from v2_model import HOME,DEFAULT,STATES,load_config,save_config,validate_account,SecureStore,templates,save_template,import_html,paste_html,import_customers,build_message,customer_fields,language,public_config,decode_html,protect_source,ProjectProfiles
 from v2_engine import Controller,Results,explain
-from v2_delivery import submit
+from v2_delivery import submit,atomic_json
 from account_guard import AccountLease
 
 class Application:
-    def __init__(self,root,home=HOME,controller=None):
-        self.root=root;self.home=Path(home);self.cfg=load_config(self.home);self.controller=controller or Controller(self.home);self.password='';self.aux_busy=False;self.aux_queue=queue.Queue();self.preview_cfg=None
+    def __init__(self,root,home=HOME,controller=None,enable_projects=False):
+        self.root = root
+        self.projects = ProjectProfiles(home) if enable_projects else None
+        self.controller = None
+        try:
+            self.project = self.projects.active if self.projects else ProjectProfiles.default
+            self.home = self.projects.home(self.project) if self.projects else Path(home)
+            self.cfg = self.projects.config(self.project) if self.projects else load_config(self.home)
+            self.controller = controller or self.open_controller(self.project)
+            self.build_window()
+        except Exception:
+            if self.controller:
+                self.controller.close()
+            if self.projects:
+                self.projects.close()
+            raise
+
+    def open_controller(self, project):
+        if not self.projects:
+            return Controller(self.home)
+        return Controller(self.projects.home(project), ledger_path=self.projects.ledger, project=project)
+
+    def build_window(self):
+        root = self.root
+        self.password = ''
+        self.aux_busy = False
+        self.aux_queue = queue.Queue()
+        self.preview_cfg = None
+        self.preview_window = None
         root.title('OpenDesk Mail · 开源桌面邮件工具');root.geometry(f'{min(1220,root.winfo_screenwidth()-60)}x{min(880,root.winfo_screenheight()-80)}');root.minsize(900,650)
         import tkinter.font as font
         for name in ('TkDefaultFont','TkTextFont','TkMenuFont'):font.nametofont(name).configure(family='Microsoft YaHei UI',size=10)
         self.tabs=ttk.Notebook(root);self.tabs.pack(fill='both',expand=True,padx=10,pady=8)
         self.send_page=ttk.Frame(self.tabs,padding=10);self.template_page=ttk.Frame(self.tabs,padding=10);self.signature_page=ttk.Frame(self.tabs,padding=10);self.help_page=ttk.Frame(self.tabs,padding=10)
         for frame,title in [(self.send_page,'客户与实时发送'),(self.template_page,'本地开发信模板'),(self.signature_page,'签名与最终预览'),(self.help_page,'帮助与本地配置')]:self.tabs.add(frame,text=title)
-        self.build_send();self.build_templates();self.build_signature();self.build_help();self.refresh_templates()
+        self.build_send();self.build_templates();self.build_signature();self.build_help();self.load_project_widgets()
         root.protocol('WM_DELETE_WINDOW',self.close);self.poll()
         if not self.cfg.get('host') or not self.cfg.get('sender'):root.after(250,self.account_dialog)
+    def save_project_widgets(self):
+        cfg = dict(self.cfg, **{key: value.get().strip() for key, value in self.mapping.items()})
+        save_config(cfg, self.home)
+        self.controller.save()
+        selection = self.tree.selection()
+        atomic_json(self.home / 'drafts/editor.json', {
+            'template_choice': self.template_choice.get(),
+            'template_fields': {key: value.get() for key, value in self.tv.items()},
+            'template_format': self.format.get(),
+            'template_body': self.body.get('1.0', 'end-1c'),
+            'edit_id': self.edit_id,
+            'template_html': self.template_html,
+            'resource_dir': self.resource_dir,
+            'attachments': self.attachments,
+            'signature_format': self.sig_format.get(),
+            'signature_body': self.sig.get('1.0', 'end-1c'),
+            'signature_resource': self.sig_resource.get(),
+            'selected_row': selection[0] if selection else None,
+        })
+
+    def load_project_widgets(self):
+        for key, value in self.mapping.items():
+            value.set(self.cfg[key])
+        self.sheet_box['values'] = sheet_names(self.cfg['file']) if self.cfg.get('file') and Path(self.cfg['file']).is_file() else ()
+        self.new_template()
+        self.refresh_templates()
+        signature = self.cfg.get('signature_html')
+        self.sig_format.set('html' if signature else 'text')
+        self.sig_resource.set(str(Path(signature).parent) if signature else '')
+        self.sig.delete('1.0', 'end')
+        self.sig.insert('1.0', decode_html(signature) if signature and Path(signature).is_file() else self.cfg.get('signature_text', ''))
+        self.sig_info.set(signature or '未配置HTML签名，可粘贴自己的HTML/文字。')
+        self.variables_text.set('生成预览后可查看当前客户表字段。语言标签 ru 表示俄语。')
+        draft_path = self.home / 'drafts/editor.json'
+        draft = json.loads(draft_path.read_text('utf-8')) if draft_path.exists() else {}
+        if draft:
+            self.template_choice.set(draft['template_choice'])
+            for key, value in self.tv.items():
+                value.set(draft['template_fields'][key])
+            self.format.set(draft['template_format'])
+            self.body.delete('1.0', 'end')
+            self.body.insert('1.0', draft['template_body'])
+            self.edit_id = draft['edit_id']
+            self.template_html = draft['template_html']
+            self.resource_dir = draft['resource_dir']
+            self.attachments = draft['attachments']
+            self.sig_format.set(draft['signature_format'])
+            self.sig_resource.set(draft['signature_resource'])
+            self.sig.delete('1.0', 'end')
+            self.sig.insert('1.0', draft['signature_body'])
+        self.body.edit_reset()
+        self.sig.edit_reset()
+        self.tree.selection_remove(*self.tree.selection())
+        self.show_rows()
+        selected = draft.get('selected_row')
+        if selected is None and self.controller.job:
+            selected = next((str(i) for i, row in enumerate(self.controller.job['rows'])
+                             if row['state'] == 'ready'), None)
+        if selected is not None and self.tree.exists(selected):
+            self.tree.selection_set(selected)
+            self.tree.see(selected)
+        log_path = self.home / 'logs/events.log'
+        while True:
+            try:
+                self.controller.events.get_nowait()
+            except queue.Empty:
+                break
+        self.log.configure(state='normal')
+        self.log.delete('1.0', 'end')
+        if log_path.exists():
+            from collections import deque
+            with log_path.open(encoding='utf-8') as log:
+                self.log.insert('end', ''.join(deque(log, maxlen=250)))
+        self.log.see('end')
+        self.log.configure(state='disabled')
+
+    def create_project(self):
+        self.guard_edit()
+        name = simpledialog.askstring('新建发送项目', '项目名称', parent=self.root)
+        if name is None:
+            return
+        project = self.projects.create(name)
+        self.project_box['values'] = list(self.projects.names.values())
+        self.project_choice.set(self.projects.names[project])
+        self.select_project()
+
+    def select_project(self, _event=None):
+        project = next(key for key, name in self.projects.names.items() if name == self.project_choice.get())
+        if project == self.project:
+            return
+        try:
+            self.guard_edit()
+            self.save_project_widgets()
+            cfg = self.projects.config(project)
+            controller = self.open_controller(project)
+            try:
+                self.projects.select(project)
+                self.controller.close()
+            except Exception:
+                controller.close()
+                raise
+            if self.preview_window is not None and self.preview_window.winfo_exists():
+                self.preview_window.destroy()
+            self.project = project
+            self.home = self.projects.home(project)
+            self.controller = controller
+            self.cfg = cfg
+            self.preview_cfg = None
+            self.load_project_widgets()
+        except Exception as exc:
+            self.project_choice.set(self.projects.names[self.project])
+            self.error(exc)
+
     def error(self,exc):messagebox.showerror('操作未执行或已暂停',explain(exc),parent=self.root)
     def guard_edit(self):
         if self.controller.busy or self.aux_busy:raise ValueError('请先安全停止当前任务，再修改配置或预览。')
@@ -32,7 +172,21 @@ class Application:
             except Exception as exc:self.error(exc)
         b=ttk.Button(parent,text=text,command=guarded);b.pack(side='left',padx=3,pady=3);return b
     def build_send(self):
-        p=self.send_page;bar=ttk.Frame(p);bar.pack(fill='x');self.button(bar,'配置/修改账号',self.account_dialog);self.button(bar,'导入客户表',self.import_file);self.button(bar,'生成预览',self.prepare);self.button(bar,'预览选中客户',self.preview_selected)
+        p = self.send_page
+        if self.projects:
+            selector = ttk.Frame(p)
+            selector.pack(fill='x')
+            self.sender_label = tk.StringVar(value=self.cfg['sender'])
+            ttk.Label(selector, text='当前账号').pack(side='left', padx=(0, 6))
+            ttk.Label(selector, textvariable=self.sender_label).pack(side='left', padx=(0, 20))
+            ttk.Label(selector, text='发送项目').pack(side='left', padx=(0, 6))
+            self.project_choice = tk.StringVar(value=self.projects.names[self.project])
+            self.project_box = ttk.Combobox(selector, textvariable=self.project_choice,
+                                           values=list(self.projects.names.values()), state='readonly', width=51)
+            self.project_box.pack(side='left')
+            self.project_box.bind('<<ComboboxSelected>>', self.select_project)
+            self.new_project_button = self.button(selector, '新建项目', self.create_project)
+        bar=ttk.Frame(p);bar.pack(fill='x');self.button(bar,'配置/修改账号',self.account_dialog);self.button(bar,'导入客户表',self.import_file);self.button(bar,'生成预览',self.prepare);self.button(bar,'预览选中客户',self.preview_selected)
         self.context=tk.StringVar();ttk.Label(p,textvariable=self.context,wraplength=1100).pack(fill='x',pady=5)
         self.mapping={};maps=ttk.Frame(p);maps.pack(fill='x')
         for key,label,width in [('sheet','工作表',18),('company_col','公司列',11),('email_col','邮箱列',11),('note_col','备注列',10),('language_col','语言列(可空)',10)]:
@@ -40,7 +194,7 @@ class Application:
             widget=ttk.Combobox(maps,textvariable=v,width=width) if key=='sheet' else ttk.Entry(maps,textvariable=v,width=width);widget.pack(side='left',padx=3)
             if key=='sheet':self.sheet_box=widget
         run=ttk.Frame(p);run.pack(fill='x',pady=5)
-        for title,cmd in [('开始本批',self.start),('暂停',self.controller.pause),('继续',self.resume),('安全停止',self.controller.stop),('修复Excel副本',self.controller.repair),('核查副本',self.check_copies),('导出日志',self.export)]:self.button(run,title,cmd)
+        for title,cmd in [('开始本批',self.start),('暂停',lambda:self.controller.pause()),('继续',self.resume),('安全停止',lambda:self.controller.stop()),('修复Excel副本',lambda:self.controller.repair()),('核查副本',self.check_copies),('导出日志',self.export)]:self.button(run,title,cmd)
         self.summary=tk.StringVar();self.detail=tk.StringVar();ttk.Label(p,textvariable=self.summary,font=('Microsoft YaHei UI',13,'bold'),wraplength=1100).pack(fill='x',pady=5);ttk.Label(p,textvariable=self.detail,wraplength=1100).pack(fill='x')
         treeframe=ttk.Frame(p);treeframe.pack(fill='both',expand=True,pady=6);self.tree=ttk.Treeview(treeframe,columns=('row','company','email','state','reason'),show='headings',height=8)
         for key,title,width in [('row','原表行',60),('company','公司名称',230),('email','邮箱',240),('state','状态',130),('reason','说明',360)]:self.tree.heading(key,text=title);self.tree.column(key,width=width,stretch=key!='row')
@@ -81,6 +235,8 @@ class Application:
         self.guard_edit();top=tk.Toplevel(self.root);top.title('首次配置/修改自己的邮箱账号');top.geometry('780x710');top.transient(self.root)
         canvas=tk.Canvas(top,highlightthickness=0);scroll=ttk.Scrollbar(top,command=canvas.yview);canvas.configure(yscrollcommand=scroll.set);scroll.pack(side='right',fill='y');canvas.pack(fill='both',expand=True);f=ttk.Frame(canvas,padding=15);item=canvas.create_window(0,0,window=f,anchor='nw');f.bind('<Configure>',lambda e:canvas.configure(scrollregion=canvas.bbox('all')));canvas.bind('<Configure>',lambda e:canvas.itemconfigure(item,width=e.width))
         values={};fields=[('market','市场/项目'),('sender_name','发件人显示名称'),('sender','邮箱地址'),('host','SMTP服务器'),('port','SMTP端口'),('security','SMTP加密方式'),('username','登录用户名(空=邮箱)'),('interval','间隔秒数(至少60)'),('batch','每批数量'),('cap','每日尝试上限(0=不限)'),('imap_host','IMAP服务器(可空)'),('imap_port','IMAP SSL/TLS端口'),('imap_sent_folder','实际Sent文件夹服务器名称')]
+        if self.projects:
+            fields = [(key, label) for key, label in fields if key != 'market']
         for i,(key,label) in enumerate(fields):
             ttk.Label(f,text=label).grid(row=i,column=0,sticky='w',pady=4);values[key]=tk.StringVar(value=str(self.cfg.get(key,'')));widget=ttk.Combobox(f,textvariable=values[key],values=['SSL/TLS','STARTTLS'],state='readonly') if key=='security' else ttk.Entry(f,textvariable=values[key],width=45);widget.grid(row=i,column=1,sticky='ew',pady=4)
         secret=tk.StringVar(value=self.password);remember=tk.BooleanVar(value=False);message=tk.StringVar(value='SMTP发送、IMAP读取副本。Foxmail只是客户端，服务器须按实际服务商核实。')
@@ -99,6 +255,8 @@ class Application:
                 if remember.get() and self.password:
                     try:SecureStore().write(cfg,self.password)
                     except Exception:messagebox.showwarning('仅当次内存保存','Windows凭据管理器不可用；没有写入明文文件。',parent=top)
+                if self.projects:
+                    self.projects.save_account(cfg)
                 save_config(cfg,self.home);self.cfg=cfg;secret.set('');top.destroy()
             except Exception as exc:message.set(explain(exc))
         def test():
@@ -177,14 +335,32 @@ class Application:
         self.controller.prepare(cfg);self.cfg=cfg;self.preview_cfg=public_config(cfg);save_config(cfg,self.home);self.show_rows()
         fields=customer_fields(cfg);names=set().union(*(item.keys() for item in fields.values())) if fields else set();names|={'company','email','note','sender'};self.variables_text.set('允许变量：'+', '.join('{{'+name+'}}' for name in sorted(names))+'。缺失、重复表头所对应的变量或未知变量不能发送；不执行模板代码，不联网翻译。')
     def show_rows(self):
+        selection = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         for i,row in enumerate(self.controller.job['rows'] if self.controller.job else []):self.tree.insert('','end',iid=str(i),values=(row['row'],row['company'],row['email'],STATES.get(row['state'],row['state']),row.get('reason','')))
+        for item in selection:
+            if self.tree.exists(item):
+                self.tree.selection_add(item)
+
     def preview_selected(self):
         if not self.controller.job:raise ValueError('请先生成预览。')
+        if self.projects:
+            self.controller.check()
+            if public_config(self.collect_cfg()) != self.controller.job['cfg']:
+                raise ValueError('项目客户表、模板或签名已变化，请重新生成预览。')
         selection=self.tree.selection()
         if not selection:raise ValueError('请选中一位客户。')
-        row=self.controller.job['rows'][int(selection[0])];msg=self.controller.message(row);path=self.home/'preview/final.html';path.parent.mkdir(parents=True,exist_ok=True);path.write_text(preview_document(msg),'utf-8');webbrowser.open(path.as_uri())
-        top=tk.Toplevel(self.root);top.title('最终邮件预览（不发送）');text=tk.Text(top,width=90,height=23,wrap='word');text.pack(fill='both',expand=True);plain=msg.get_body(preferencelist=('plain',)).get_content();text.insert('1.0',f"收件人：{row['email']}\n主题：{msg['Subject']}\n附件：{', '.join(p.get_filename() or '' for p in msg.iter_attachments())}\n\n{plain}");text.configure(state='disabled')
+        row = self.controller.job['rows'][int(selection[0])]
+        self.show_message_preview(self.controller.message(row), 'final.html')
+
+    def show_message_preview(self, msg, filename):
+        path = self.home / 'preview' / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(preview_document(msg), 'utf-8')
+        webbrowser.open(path.as_uri())
+        if self.preview_window is not None and self.preview_window.winfo_exists():
+            self.preview_window.destroy()
+        top=tk.Toplevel(self.root);self.preview_window=top;top.title('最终邮件预览（不发送）');text=tk.Text(top,width=90,height=23,wrap='word');text.pack(fill='both',expand=True);plain=msg.get_body(preferencelist=('plain',)).get_content();text.insert('1.0',f"发件人：{msg['From']}\n收件人：{msg['To']}\n主题：{msg['Subject']}\n附件：{', '.join(p.get_filename() or '' for p in msg.iter_attachments())}\n\n{plain}");text.configure(state='disabled')
     def password_for(self,cfg):
         if self.password:return self.password
         try:self.password=SecureStore().read(cfg) or ''
@@ -210,7 +386,7 @@ class Application:
         pwd=self.password_for(cfg)
         self.run_aux(lambda:(self.controller.copy_checker(cfg,pwd,results),self.controller.repair(),'只读副本核查完成，未发信；请查看工作副本。')[-1])
     def new_template(self):
-        self.guard_edit();self.edit_id='';self.template_html='';self.attachments=[];self.tv['name'].set('');self.tv['subject'].set('');self.tv['language'].set('en');self.format.set('text');self.body.delete('1.0','end')
+        self.guard_edit();self.edit_id='';self.template_html='';self.attachments=[];self.tv['name'].set('');self.tv['subject'].set('');self.tv['language'].set('en');self.format.set('text');self.resource_dir='';self.body.delete('1.0','end')
     def refresh_templates(self):
         self.template_ids={v['name']+' ['+v['language']+']':k for k,v in templates(self.home).items()};self.template_box['values']=list(self.template_ids)
         selected=next((name for name,key in self.template_ids.items() if key==self.cfg.get('template_id')),next(iter(self.template_ids),''));self.template_choice.set(selected)
@@ -242,10 +418,16 @@ class Application:
         path=filedialog.asksaveasfilename(defaultextension='.csv',filetypes=[('CSV日志','*.csv')])
         if path:export_csv(protect_source(path),['开始时间','邮箱','公司','主题','状态','详情','Message-ID'],self.controller.ledger.rows())
     def poll(self):
+        if self.projects:
+            self.sender_label.set(self.cfg['sender'])
+            busy = self.controller.busy or self.aux_busy
+            self.project_box.configure(state='disabled' if busy else 'readonly')
+            self.new_project_button.configure(state='disabled' if busy else 'normal')
         for page in (self.template_page,self.signature_page):self.tabs.tab(page,state='disabled' if self.controller.busy else 'normal')
         try:
             while True:
-                line=self.controller.events.get_nowait();self.log.configure(state='normal');self.log.insert('end',line+'\n');self.log.see('end');self.log.configure(state='disabled');self.show_rows()
+                line=self.controller.events.get_nowait();self.log.configure(state='normal');self.log.insert('end',line+'\n');self.log.see('end');self.log.configure(state='disabled')
+                self.show_rows()
         except queue.Empty:pass
         try:
             while True:
@@ -265,4 +447,13 @@ class Application:
         if self.controller.busy or self.aux_busy:
             if messagebox.askyesno('安全关闭','当前操作尚未结束。是否请求安全停止？当前SMTP提交不会被强行中断，请完成后再关闭。',parent=self.root):self.controller.stop()
             return
-        self.password='';self.controller.close();self.root.after_cancel(self._timer);self.root.destroy()
+        if self.projects:
+            try:
+                self.save_project_widgets()
+            except Exception as exc:
+                self.error(exc)
+                return
+        self.password='';self.controller.close();self.root.after_cancel(self._timer)
+        if self.projects:
+            self.projects.close()
+        self.root.destroy()
